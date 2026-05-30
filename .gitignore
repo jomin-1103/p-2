@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environment
+.env
+
+# Data (PDF 원본은 커밋하지 않음)
+data/pdfs/*
+!data/pdfs/.gitkeep
+
+# PostgreSQL volume (docker)
+pgdata/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
