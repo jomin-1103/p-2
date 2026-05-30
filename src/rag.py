@@ -7,11 +7,13 @@
 """
 from __future__ import annotations
 
+import json
+import re
 from typing import Iterator
 
 import ollama
 
-from . import db, embeddings
+from . import config, db, embeddings
 from .config import settings
 
 _client = ollama.Client(host=settings.ollama_host)
@@ -98,3 +100,84 @@ def answer(query: str, mode: str = "qa",
     """스트리밍 없이 완성된 답변 문자열과 출처를 반환 (CLI/테스트용)."""
     gen, results = generate(query, mode=mode, history=history)
     return "".join(gen), results
+
+
+# ─────────────────────────────────────────────────────────────
+# 구조화 요청: "21년도 1과목" → 과목별 문제/선지/해설
+# ─────────────────────────────────────────────────────────────
+
+# "21년", "2021년도", "13 년" 등에서 연도 / "1과목" 에서 과목 추출
+_YEAR_RE = re.compile(r"(?:20)?(\d{2})\s*년")
+_SUBJECT_RE = re.compile(r"([1-5])\s*과목")
+
+
+def parse_exam_request(query: str) -> tuple[int, int] | None:
+    """질의에서 (연도, 과목번호) 를 추출. 둘 다 있으면 구조화 요청으로 간주."""
+    ym = _YEAR_RE.search(query)
+    sm = _SUBJECT_RE.search(query)
+    if not (ym and sm):
+        return None
+    yy = int(ym.group(1))
+    year = 2000 + yy if yy < 90 else 1900 + yy
+    return year, int(sm.group(1))
+
+
+_EXAM_SYSTEM = (
+    "당신은 한국 '정보보안산업기사' 기출문제를 정리하는 도우미입니다. "
+    "제공된 <참고자료> 안에 있는 문제만 사용하고, 자료에 없는 문제를 지어내지 마세요. "
+    "반드시 한국어로, 지정한 JSON 형식으로만 응답하세요."
+)
+
+_EXAM_SCHEMA = (
+    '{"questions": [{"number": 정수, "question": "문제 본문", '
+    '"choices": ["①...", "②...", "③...", "④..."], '
+    '"answer": "정답 보기", "explanation": "해설"}]}'
+)
+
+
+def fetch_exam_questions(year: int, subject: int) -> tuple[list[dict], list[dict]]:
+    """해당 연도·과목의 문제를 구조화해서 반환.
+
+    Returns: (questions, sources)
+      - questions: number/question/choices/answer/explanation 딕셔너리 목록
+      - sources:   근거로 사용한 청크(출처 표시용)
+    """
+    with db.connection() as conn:
+        rows = db.search_by_meta(conn, year, subject, limit=80)
+        if not rows:
+            # 메타 태깅이 없을 때를 대비한 의미 검색 폴백
+            sname = config.subject_name(subject)
+            emb = embeddings.embed_text(f"{year}년 정보보안산업기사 {subject}과목 {sname} 기출문제")
+            rows = db.search(conn, emb, top_k=40)
+
+    if not rows:
+        return [], []
+
+    sname = config.subject_name(subject)
+    context = build_context(rows)
+    user = (
+        f"다음은 {year}년도 정보보안산업기사 {subject}과목({sname}) 관련 기출 자료입니다.\n"
+        f"이 자료에서 {subject}과목에 해당하는 문제를 문제 번호 순서대로 모두 정리하세요.\n"
+        "각 문제마다 문제 본문, 선지(보기), 정답, 해설을 채웁니다.\n"
+        "- 자료에 해설이 없으면 정답 근거를 바탕으로 간결한 해설을 직접 작성하고, "
+        "해설 앞에 '(AI 생성 해설) ' 을 붙이세요.\n"
+        "- 정답이 자료에 명시되지 않았으면 가장 타당한 보기를 정답으로 고르고 그 이유를 해설에 적으세요.\n\n"
+        f"<참고자료>\n{context}\n</참고자료>\n\n"
+        f"아래 JSON 스키마로만 출력하세요:\n{_EXAM_SCHEMA}"
+    )
+
+    resp = _client.chat(
+        model=settings.llm_model,
+        messages=[
+            {"role": "system", "content": _EXAM_SYSTEM},
+            {"role": "user", "content": user},
+        ],
+        format="json",
+    )
+    raw = resp["message"]["content"]
+    try:
+        data = json.loads(raw)
+        questions = data.get("questions", []) if isinstance(data, dict) else []
+    except (json.JSONDecodeError, TypeError):
+        questions = []
+    return questions, rows

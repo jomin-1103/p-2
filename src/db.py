@@ -5,8 +5,9 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import psycopg2
 from psycopg2.extras import Json, execute_values
@@ -20,6 +21,20 @@ def get_connection():
     return psycopg2.connect(**settings.dsn)
 
 
+@contextmanager
+def connection() -> Iterator["psycopg2.extensions.connection"]:
+    """커밋/롤백 후 반드시 연결을 닫는 컨텍스트 매니저."""
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _vec_literal(vec: Sequence[float]) -> str:
     """파이썬 시퀀스를 pgvector 입력 리터럴로 변환."""
     return "[" + ",".join(format(float(x), ".8g") for x in vec) + "]"
@@ -28,7 +43,7 @@ def _vec_literal(vec: Sequence[float]) -> str:
 def init_schema() -> None:
     """db/init.sql 을 실행해 확장/테이블/인덱스를 (멱등하게) 생성."""
     sql = _INIT_SQL.read_text(encoding="utf-8")
-    with get_connection() as conn, conn.cursor() as cur:
+    with connection() as conn, conn.cursor() as cur:
         cur.execute(sql)
 
 
@@ -50,7 +65,7 @@ def source_exists(conn, source: str) -> bool:
 def insert_chunks(conn, rows: Iterable[dict]) -> int:
     """청크 행들을 일괄 삽입.
 
-    각 행: {source, page, chunk_index, content, embedding, metadata?}
+    각 행: {source, page, chunk_index, content, embedding, year?, subject?, metadata?}
     """
     rows = list(rows)
     if not rows:
@@ -62,6 +77,8 @@ def insert_chunks(conn, rows: Iterable[dict]) -> int:
             r["chunk_index"],
             r["content"],
             _vec_literal(r["embedding"]),
+            r.get("year"),
+            r.get("subject"),
             Json(r.get("metadata", {})),
         )
         for r in rows
@@ -71,14 +88,19 @@ def insert_chunks(conn, rows: Iterable[dict]) -> int:
             cur,
             """
             INSERT INTO documents
-                (source, page, chunk_index, content, embedding, metadata)
+                (source, page, chunk_index, content, embedding, year, subject, metadata)
             VALUES %s
             """,
             values,
-            template="(%s, %s, %s, %s, %s::vector, %s)",
+            template="(%s, %s, %s, %s, %s::vector, %s, %s, %s)",
         )
     conn.commit()
     return len(values)
+
+
+def _rows_to_dicts(cur) -> list[dict]:
+    cols = [c.name for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def search(conn, query_embedding: Sequence[float], top_k: int,
@@ -93,7 +115,7 @@ def search(conn, query_embedding: Sequence[float], top_k: int,
     params += [emb, top_k]
 
     sql = f"""
-        SELECT source, page, chunk_index, content,
+        SELECT source, page, chunk_index, content, year, subject,
                1 - (embedding <=> %s::vector) AS score
         FROM documents
         {where}
@@ -102,8 +124,32 @@ def search(conn, query_embedding: Sequence[float], top_k: int,
     """
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return _rows_to_dicts(cur)
+
+
+def search_by_meta(conn, year: int | None, subject: int | None,
+                   limit: int = 80) -> list[dict]:
+    """연도/과목 메타데이터로 필터링해 페이지·청크 순서대로 반환."""
+    clauses, params = [], []
+    if year is not None:
+        clauses.append("year = %s")
+        params.append(year)
+    if subject is not None:
+        clauses.append("subject = %s")
+        params.append(subject)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+
+    sql = f"""
+        SELECT source, page, chunk_index, content, year, subject
+        FROM documents
+        {where}
+        ORDER BY source, page, chunk_index
+        LIMIT %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return _rows_to_dicts(cur)
 
 
 def list_sources(conn) -> list[dict]:
@@ -117,8 +163,16 @@ def list_sources(conn) -> list[dict]:
             ORDER BY source
             """
         )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return _rows_to_dicts(cur)
+
+
+def list_years(conn) -> list[int]:
+    """적재된 연도 목록."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT year FROM documents WHERE year IS NOT NULL ORDER BY year"
+        )
+        return [r[0] for r in cur.fetchall()]
 
 
 def count_chunks(conn) -> int:

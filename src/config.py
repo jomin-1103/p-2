@@ -45,3 +45,21 @@ class Settings:
 
 
 settings = Settings()
+
+
+# ── 정보보안산업기사 과목 구성 ──────────────────────────────
+# 실제 시행 회차/구성에 맞게 자유롭게 수정하세요. (키: 과목 번호)
+SUBJECTS: dict[int, str] = {
+    1: "시스템 보안",
+    2: "네트워크 보안",
+    3: "애플리케이션 보안",
+    4: "정보보안 일반",
+    5: "정보보안 관리 및 법규",
+}
+
+# 과목당 문항 수 (질문 번호로 과목을 추정할 때 사용)
+QUESTIONS_PER_SUBJECT: int = _int("QUESTIONS_PER_SUBJECT", 20)
+
+
+def subject_name(no: int) -> str:
+    return SUBJECTS.get(no, f"{no}과목")

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,31 @@ from . import db, embeddings
 from .config import settings
 
 DEFAULT_DIR = Path("data/pdfs")
+
+# "1과목", "제 1 과목" 등 과목 헤더 패턴
+_SUBJECT_RE = re.compile(r"제?\s*([1-5])\s*과목")
+# 4자리(2013) 또는 '21년' 형태의 2자리 연도
+_YEAR4_RE = re.compile(r"(19|20)\d{2}")
+_YEAR2_RE = re.compile(r"(\d{2})\s*년")
+
+
+def detect_year(filename: str, first_text: str = "") -> int | None:
+    """파일명 → 본문 순으로 시행 연도를 추정."""
+    for text in (filename, first_text):
+        m = _YEAR4_RE.search(text)
+        if m:
+            return int(m.group(0))
+        m = _YEAR2_RE.search(text)
+        if m:
+            yy = int(m.group(1))
+            return 2000 + yy if yy < 90 else 1900 + yy
+    return None
+
+
+def detect_subject(text: str) -> int | None:
+    """페이지 텍스트에서 마지막으로 등장한 과목 번호를 반환."""
+    matches = _SUBJECT_RE.findall(text)
+    return int(matches[-1]) if matches else None
 
 
 def extract_pages(path: Path) -> list[tuple[int, str]]:
@@ -51,8 +77,16 @@ def ingest_pdf(conn, path: Path, *, force: bool = False) -> int:
         removed = db.delete_source(conn, source)
         print(f"♻️  기존 청크 {removed}개 삭제 후 재적재: {source}")
 
+    pages = extract_pages(path)
+    first_text = pages[0][1] if pages else ""
+    year = detect_year(source, first_text)
+
     rows: list[dict] = []
-    for page_no, text in extract_pages(path):
+    current_subject: int | None = None  # 과목 헤더는 이후 페이지로 전파
+    for page_no, text in pages:
+        found = detect_subject(text)
+        if found is not None:
+            current_subject = found
         chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
         for idx, chunk in enumerate(chunks):
             rows.append({
@@ -60,7 +94,12 @@ def ingest_pdf(conn, path: Path, *, force: bool = False) -> int:
                 "page": page_no,
                 "chunk_index": idx,
                 "content": chunk,
+                "year": year,
+                "subject": current_subject,
             })
+
+    print(f"   ↳ 감지된 연도: {year or '미상'}, "
+          f"태깅된 과목 수: {len({r['subject'] for r in rows if r['subject']})}")
 
     if not rows:
         print(f"⚠️  추출된 텍스트가 없습니다(스캔 이미지 PDF일 수 있음): {source}")
